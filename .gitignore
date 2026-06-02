@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated data (regenerated each scan)
+cache/
+results/
+
+# Temp/debug helpers
+_check.js
+_rendered.html

@@ -1,0 +1,8 @@
+# Add custom tickers here, one per line
+# Lines starting with # are comments
+# These will be added to the selected universe
+#
+# Examples:
+# PLTR
+# SOFI
+# RIVN
