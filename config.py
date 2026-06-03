@@ -33,8 +33,11 @@ BACKTEST_HISTORY_PERIOD = "10y"  # how far back to backtest. TradingView's chart
 # loads years of bars, so 10y matches its trade counts/verdicts far better than
 # 5y (e.g. TWLO: 5y=1 trade NEED DATA, 10y=5 trades GOOD like TradingView).
 # A setup is "PRIME" (strong buy) only when the live verdict is ENTER AND the
-# backtest is strongly green (GOOD/EXCELLENT) with a score at/above this.
+# backtest is strongly green (GOOD/EXCELLENT) with a score at/above this AND
+# has at least PRIME_MIN_TRADES historical trades (so a thin 3-trade sample
+# can't be promoted to a top "strong buy").
 PRIME_MIN_SCORE = 60
+PRIME_MIN_TRADES = 5
 
 # === Account & Risk ===
 ACCOUNT_SIZE = 2000.0

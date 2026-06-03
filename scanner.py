@@ -8,10 +8,11 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import json
+import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from config import *
 
@@ -71,6 +72,29 @@ def bars_since_fresh_flip(bx, noise_floor):
         if bx[-k] <= noise_floor:
             return k - 1
     return 999
+
+
+def json_safe(obj):
+    """Recursively replace NaN/Inf floats with None so the written JSON is
+    valid (json.dump emits bare NaN/Infinity, which breaks JSON.parse in the
+    browser's /api/results fetch)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    return obj
+
+
+def session_forming():
+    """True if the current US daily bar is still forming (weekday, before the
+    16:00 ET close) - in that case the latest downloaded daily bar is partial
+    and must be dropped so signals are computed only on confirmed bars."""
+    now = pd.Timestamp.now(tz="America/New_York")
+    if now.weekday() >= 5:      # Sat/Sun: last bar is Friday (complete)
+        return False
+    return now.hour < 16        # before the 16:00 ET close
 
 
 # ============================================================
@@ -323,6 +347,11 @@ def analyze_stock(ticker, df):
         monthly["bx"] = bx_trender(monthly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
         bx_m = float(monthly["bx"].iloc[-1])
         bx_m_prev = float(monthly["bx"].iloc[-2]) if len(monthly) > 1 else 0.0
+
+        # Skip degenerate stocks whose BX is NaN (e.g. perfectly flat price over
+        # the RSI window). NaN would otherwise break the JSON feed and the JS.
+        if not (math.isfinite(bx_d) and math.isfinite(bx_w) and math.isfinite(bx_m)):
+            return None
 
         # --- Filters ---
         m_green = bx_m > 0
@@ -766,6 +795,15 @@ def run_scan():
     print(f"\n[2/5] Downloading market data...")
     data = download_data(tickers)
 
+    # Drop today's still-forming daily bar if the US session is open, so signals
+    # use only confirmed bars (safe to scan any time of day).
+    if session_forming() and len(data) > 1:
+        last_date = pd.Timestamp(data.index[-1]).date()
+        today_et = pd.Timestamp.now(tz="America/New_York").date()
+        if last_date == today_et:
+            data = data.iloc[:-1]
+            print("  Dropped today's still-forming daily bar (using confirmed bars only).")
+
     # 3. Analyze each stock
     print(f"\n[3/5] Analyzing stocks...")
     results = []
@@ -804,12 +842,15 @@ def run_scan():
     if candidates and BLOCK_EARNINGS:
         print(f"  Checking {len(candidates)} stocks...")
         earnings = check_earnings_batch(candidates)
+        unknown = 0
         for r in results:
             if r["ticker"] in earnings:
                 days = earnings[r["ticker"]]
                 r["earnings_days"] = round(days) if days is not None else None
-                # Block if earnings is imminent: from "happening today" (-1)
-                # up to the buffer window ahead.
+                # FAIL-SAFE: if the earnings date is unknown (data source failed),
+                # do NOT treat it as safe. Mark it unknown so it can't become a
+                # confident STRONG BUY, and warn the user to verify manually.
+                r["earnings_known"] = days is not None
                 if days is not None and -1 <= days <= EARNINGS_BUFFER_DAYS:
                     r["near_earnings"] = True
                     if r["status"] == "ENTER":
@@ -819,13 +860,22 @@ def run_scan():
                         r["missing"].append(f"Earnings {d_lbl}")
                 else:
                     r["near_earnings"] = False
+                    if not r["earnings_known"] and r["status"] == "ENTER":
+                        unknown += 1
+                        r["missing"].append("Earnings unknown - verify")
             else:
                 r["earnings_days"] = None
                 r["near_earnings"] = False
+                r["earnings_known"] = False
+        if unknown:
+            print(f"  WARNING: earnings date unknown for {unknown} ENTER stock(s) "
+                  f"(data source failed) - they will NOT be marked STRONG BUY.")
     else:
+        # Earnings filter disabled by config -> treat as known/not-applicable.
         for r in results:
             r["earnings_days"] = None
             r["near_earnings"] = False
+            r["earnings_known"] = not BLOCK_EARNINGS
 
     # 5. Backtest actionable setups for scoring.
     # Downloads EXTENDED history (10y) for just the candidates - TradingView's
@@ -874,6 +924,8 @@ def run_scan():
             r["status"] == "ENTER" and bt
             and bt["verdict"] in ("GOOD", "EXCELLENT")
             and (r["score"] or 0) >= PRIME_MIN_SCORE
+            and bt["trades"] >= PRIME_MIN_TRADES
+            and r.get("earnings_known")          # fail-safe: never prime on unknown earnings
         )
 
     # Sort: prime first, then status priority, then backtest score, then daily BX
@@ -943,6 +995,8 @@ def run_scan():
     base = os.path.dirname(__file__)
     results_dir = os.path.join(base, "results")
     os.makedirs(results_dir, exist_ok=True)
+
+    output = json_safe(output)   # strip any NaN/Inf so the JSON stays valid
 
     latest = os.path.join(results_dir, "latest.json")
     with open(latest, "w") as f:
