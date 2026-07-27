@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy to notify_config.json (gitignored) and fill in. Never put a password in the tracked example file. Every key here is optional - notify.py falls back to the DEFAULTS in its own source.",
+
+  "_transport": "Elastic Email is what the pgishonim system already sends through, so the account exists and pgishonim.com is a verified sender. For Zoho instead: smtp.zoho.com / 465 / \"ssl\", and an app-specific password.",
+  "smtp_host": "smtp.elasticemail.com",
+  "smtp_port": 2525,
+  "smtp_security": "starttls",
+
+  "_credentials": "Leave smtp_user/smtp_password empty and point env_file at an existing .env - the notifier reads the two keys out of it at send time, so no secret is ever stored in this project.",
+  "env_file": "D:\\RsiDevOne\\Pgishonim\\clones\\pgishonim\\.env_pgishonim",
+  "env_user_key": "SMTP_USERNAME",
+  "env_password_key": "SMTP_PASSWORD",
+  "smtp_user": "",
+  "smtp_password": "",
+
+  "mail_from": "noreply@pgishonim.com",
+  "mail_from_name": "DiCarlo BX Scanner",
+  "mail_to": ["pgishonim@gmail.com"],
+
+  "_behaviour": "daily_digest sends a summary even on days with zero strong buys, so a quiet inbox proves the scan ran. realert_days stops the same ticker alerting on each of the 2-3 scans it stays prime for.",
+  "daily_digest": true,
+  "realert_days": 5,
+  "stale_hours": 20,
+  "max_enter_rows": 25,
+  "dashboard_url": "http://localhost:5555"
+}

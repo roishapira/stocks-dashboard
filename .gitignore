@@ -7,6 +7,11 @@ __pycache__/
 cache/
 results/
 
+# Email notifier - local settings (recipients, path to the .env holding the
+# SMTP credentials) and the "what did I already alert on" state
+notify_config.json
+notify_state.json
+
 # Temp/debug helpers
 _check.js
 _rendered.html

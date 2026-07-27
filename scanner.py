@@ -1014,4 +1014,24 @@ def run_scan():
 
 
 if __name__ == "__main__":
-    run_scan()
+    try:
+        output = run_scan()
+    except Exception:
+        # A crash must not fail silently - from the inbox side it looks exactly
+        # like "no opportunities today", which is the one thing worse than noise.
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        try:
+            import notify
+            print(f"  [notify] {notify.notify_failure(tb)}")
+        except Exception as e:
+            print(f"  [notify] could not send failure mail: {e}")
+        raise
+
+    try:
+        import notify
+        print(f"\n  [notify] {notify.notify(output)}")
+    except Exception as e:
+        # A mail problem never invalidates a good scan.
+        print(f"\n  [notify] skipped: {type(e).__name__}: {e}")
