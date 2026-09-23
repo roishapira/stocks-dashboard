@@ -15,3 +15,6 @@ notify_state.json
 # Temp/debug helpers
 _check.js
 _rendered.html
+
+# Trades you actually took (personal position data)
+positions.json

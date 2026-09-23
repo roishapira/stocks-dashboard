@@ -423,10 +423,11 @@ def analyze_stock(ticker, df):
         risk_pct = (risk_amount / ACCOUNT_SIZE) * 100.0 if ACCOUNT_SIZE > 0 else 0
         too_small = shares == 0 or cost < MIN_POSITION_SIZE
 
-        # Profit targets
-        target_50_price = price * 1.5
-        profit_50 = (target_50_price - price) * shares - (COMMISSION_PER_TRADE * 2)
-        rr = profit_50 / risk_amount if risk_amount > 0 else 0
+        # Profit target - DISPLAY ONLY, see TARGET_PROFIT_PCT in config.py.
+        # No exit is taken here; it only gives the displayed R:R a reference.
+        target_price = price * (1.0 + TARGET_PROFIT_PCT / 100.0)
+        target_profit = (target_price - price) * shares - (COMMISSION_PER_TRADE * 2)
+        rr = target_profit / risk_amount if risk_amount > 0 else 0
 
         # --- Status ---
         all_green = m_green and w_green and d_green
@@ -500,8 +501,9 @@ def analyze_stock(ticker, df):
             "risk_pct": round(risk_pct, 1),
             "method": method,
             "too_small": too_small,
-            "target_50": round(target_50_price, 2),
-            "profit_50": round(profit_50, 2),
+            "target_pct": TARGET_PROFIT_PCT,
+            "target_price": round(target_price, 2),
+            "target_profit": round(target_profit, 2),
             "rr": round(rr, 1),
             "atr": round(atr_val, 2),
             "status": status,
@@ -722,6 +724,273 @@ def _backtest_stats(pnls, holds, stopped):
 
 
 # ============================================================
+# OPEN POSITION MONITOR (the exit half of the strategy)
+# ============================================================
+# The backtest exits a trade on exactly two events (see run_backtest):
+#   1. the daily LOW touched the stop
+#   2. the weekly OR monthly BX turned red
+# There is no profit target - the trade rides until the higher timeframe
+# breaks. This section applies those same two rules to the trades actually
+# held (positions.json) so the daily mail can say GET OUT.
+#
+# One deliberate difference from analyze_stock(): entries read the LIVE,
+# still-forming weekly/monthly bar, but an EXIT is only confirmed on a
+# CLOSED higher-timeframe bar - which is what the backtest uses (it ffills
+# from the period-END label, i.e. the last completed bar). Mid-week dips
+# through zero that recover by Friday would otherwise throw you out of good
+# trades. A still-forming bar that is already red is reported as WATCH.
+
+POSITION_ACTION_ORDER = {"EXIT": 0, "WATCH": 1, "NO DATA": 2, "HOLD": 3}
+
+
+def _last_closed_idx(period_index, last_daily_date):
+    """Position (-1 or -2) of the last CLOSED higher-timeframe bar.
+
+    resample() labels each group by its right edge (the Friday / month-end).
+    If that label is still in the future relative to the newest daily bar,
+    the period has not finished yet and the previous one is the last closed."""
+    if len(period_index) == 0:
+        return None
+    if pd.Timestamp(period_index[-1]).date() <= last_daily_date:
+        return -1
+    return -2 if len(period_index) >= 2 else None
+
+
+def evaluate_position(pos, df):
+    """Apply the strategy's exit rules to one open trade.
+
+    Returns the position enriched with the verdict. `reasons` are structured
+    codes, not sentences - notify.py renders them in Hebrew, the dashboard in
+    English, from the same data."""
+    base = {
+        "id": pos.get("id"),
+        "ticker": pos.get("ticker"),
+        "entry_date": pos.get("entry_date"),
+        "entry_price": pos.get("entry_price"),
+        "shares": pos.get("shares"),
+        "stop": pos.get("stop"),
+        "note": pos.get("note", ""),
+    }
+    try:
+        df = df.dropna(subset=["Close"]).copy()
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
+        if len(df) < 60:
+            return {**base, "action": "NO DATA", "reasons": [{"code": "no_data"}]}
+
+        last_date = pd.Timestamp(df.index[-1]).date()
+        price = float(df["Close"].iloc[-1])
+
+        # --- BX on all three timeframes ---
+        bx_d = float(bx_trender(df["Close"], SHORT_L1, SHORT_L2, SHORT_L3).iloc[-1])
+
+        weekly = df.resample("W-FRI").agg({"Close": "last"}).dropna(subset=["Close"])
+        monthly = df.resample("M").agg({"Close": "last"}).dropna(subset=["Close"])
+        wk_bx = bx_trender(weekly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
+        mo_bx = bx_trender(monthly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
+
+        wi = _last_closed_idx(weekly.index, last_date)
+        mi = _last_closed_idx(monthly.index, last_date)
+        bx_w = float(wk_bx.iloc[wi]) if wi is not None else None
+        bx_m = float(mo_bx.iloc[mi]) if mi is not None else None
+        bx_w_live = float(wk_bx.iloc[-1])
+        bx_m_live = float(mo_bx.iloc[-1])
+
+        # --- Stop: scan every bar held, not just today's. A stop that was hit
+        # on a day the scan didn't run must still be reported. ---
+        stop = float(pos.get("stop") or 0)
+        entry_price = float(pos.get("entry_price") or 0)
+        shares = int(pos.get("shares") or 0)
+
+        try:
+            entry_ts = pd.Timestamp(pos.get("entry_date"))
+        except (TypeError, ValueError):
+            entry_ts = pd.Timestamp(df.index[-1])
+        held = df[df.index >= entry_ts]
+        low_since = float(held["Low"].min()) if len(held) else None
+        high_since = float(held["High"].max()) if len(held) else None
+
+        # --- Stop ladder (config.STOP_LADDER): once the HIGH since entry has
+        # reached +trigger%, the stop is at least entry*(1+lock%). The level to
+        # set at the broker uses the latest peak; the exit test below uses the
+        # peak up to the PREVIOUS bar, so a bar's own high never sets the stop
+        # its own low is tested against (same convention as the research).
+        ladder_now = stop
+        if entry_price > 0 and high_since is not None:
+            for trg, lock in STOP_LADDER:
+                if high_since >= entry_price * (1.0 + trg / 100.0):
+                    ladder_now = max(ladder_now, entry_price * (1.0 + lock / 100.0))
+        stop_raised = None
+        if stop > 0 and ladder_now > stop + 1e-9:
+            stop_raised = {"from": round(stop, 2), "to": round(ladder_now, 2)}
+            for trg, lock in STOP_LADDER:
+                if abs(entry_price * (1.0 + lock / 100.0) - ladder_now) < 1e-6:
+                    stop_raised.update({"trigger": trg, "lock": lock})
+
+        stop_hit = False
+        stop_hit_date = None
+        if stop > 0 and len(held):
+            highs = held["High"].to_numpy(float)
+            lows = held["Low"].to_numpy(float)
+            peak_prev = np.r_[entry_price, np.maximum.accumulate(highs)[:-1]]
+            # The recorded stop only counts from the day it was in force:
+            # stop_since (set at registration) and every later change kept in
+            # stop_log. Before that only the ladder applies (fmax ignores NaN),
+            # so a stop raised today is never tested against last month's lows.
+            idx = held.index.normalize()
+            log = [e for e in (pos.get("stop_log") or []) if isinstance(e, dict) and e.get("date")]
+            first_stop = float(log[0]["from"]) if log and log[0].get("from") is not None else stop
+            segments = [(pos.get("stop_since") or pos.get("entry_date"), first_stop)]
+            for e in log:
+                try:
+                    segments.append((e["date"], float(e["to"])))
+                except (TypeError, ValueError, KeyError):
+                    pass
+            level = np.full(len(lows), np.nan)
+            for d, sv in segments:
+                try:
+                    d_ts = pd.Timestamp(d).normalize()
+                except (TypeError, ValueError):
+                    continue
+                if pd.isna(d_ts) or not sv > 0:
+                    continue
+                level = np.where(idx >= d_ts, sv, level)
+            for trg, lock in STOP_LADDER:
+                level = np.where(peak_prev >= entry_price * (1.0 + trg / 100.0),
+                                 np.fmax(level, entry_price * (1.0 + lock / 100.0)), level)
+            with np.errstate(invalid="ignore"):
+                hit = lows <= level
+            if hit.any():
+                stop_hit = True
+                first = int(np.argmax(hit))
+                stop_hit_date = str(pd.Timestamp(held.index[first]).date())
+                stop = float(level[first])      # the level that was actually hit
+
+        # --- Verdict ---
+        reasons = []
+        action = "HOLD"
+
+        if stop_raised:
+            reasons.append({"code": "stop_raised", **stop_raised})
+            base["stop"] = stop_raised["to"]
+        if stop_hit:
+            action = "EXIT"
+            reasons.append({"code": "stop_hit", "stop": round(stop, 2),
+                            "low": round(low_since, 2), "date": stop_hit_date})
+        if bx_w is not None and bx_w < 0:
+            action = "EXIT"
+            reasons.append({"code": "weekly_red", "value": round(bx_w, 2)})
+        if bx_m is not None and bx_m < 0:
+            action = "EXIT"
+            reasons.append({"code": "monthly_red", "value": round(bx_m, 2)})
+
+        if action == "HOLD":
+            if bx_w_live < 0:
+                action = "WATCH"
+                reasons.append({"code": "weekly_red_forming", "value": round(bx_w_live, 2)})
+            if bx_m_live < 0:
+                action = "WATCH"
+                reasons.append({"code": "monthly_red_forming", "value": round(bx_m_live, 2)})
+        if action == "HOLD":
+            if bx_d < 0:
+                reasons.append({"code": "daily_red", "value": round(bx_d, 2)})
+            else:
+                reasons.append({"code": "all_green"})
+
+        pnl = (price - entry_price) * shares - (COMMISSION_PER_TRADE * 2)
+        pnl_pct = ((price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+        days_held = (last_date - entry_ts.date()).days
+
+        return {
+            **base,
+            "price": round(price, 2),
+            "as_of": str(last_date),
+            "days_held": max(days_held, 0),
+            "value": round(price * shares, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "bx_d": round(bx_d, 2),
+            "bx_w": round(bx_w, 2) if bx_w is not None else None,
+            "bx_m": round(bx_m, 2) if bx_m is not None else None,
+            "bx_w_live": round(bx_w_live, 2),
+            "bx_m_live": round(bx_m_live, 2),
+            "stop_hit": stop_hit,
+            "stop_hit_date": stop_hit_date,
+            "action": action,
+            "reasons": reasons,
+        }
+    except Exception as e:
+        return {**base, "action": "NO DATA",
+                "reasons": [{"code": "error", "text": f"{type(e).__name__}: {e}"}]}
+
+
+def check_open_positions():
+    """Download fresh history for every open trade and run the exit rules.
+
+    Downloads separately from the main scan on purpose: a held ticker may be
+    outside the universe, may fail the liquidity gate, or may simply be
+    missing from a cache that was filled before it was added."""
+    try:
+        import positions as positions_store
+        opens = positions_store.open_positions()
+    except Exception as e:
+        print(f"  Could not read positions.json: {e}")
+        return []
+
+    if not opens:
+        print("  No open positions recorded.")
+        return []
+
+    tickers = sorted({p["ticker"] for p in opens})
+    print(f"  {len(opens)} open position(s): {', '.join(tickers)}")
+
+    try:
+        pdata = yf.download(tickers, period=MAIN_HISTORY_PERIOD,
+                            threads=True, progress=False)
+    except Exception as e:
+        print(f"  Position data download error: {e}")
+        return [{**p, "action": "NO DATA",
+                 "reasons": [{"code": "error", "text": str(e)}]} for p in opens]
+
+    if pdata is None or pdata.empty:
+        return [{**p, "action": "NO DATA", "reasons": [{"code": "no_data"}]}
+                for p in opens]
+
+    # Same still-forming-bar guard as the main scan.
+    if session_forming() and len(pdata) > 1:
+        last_date = pd.Timestamp(pdata.index[-1]).date()
+        if last_date == pd.Timestamp.now(tz="America/New_York").date():
+            pdata = pdata.iloc[:-1]
+
+    rows = []
+    for p in opens:
+        try:
+            if isinstance(pdata.columns, pd.MultiIndex):
+                tdf = pdata.xs(p["ticker"], level="Ticker", axis=1).dropna(how="all")
+            else:
+                tdf = pdata.dropna(how="all")
+            row = evaluate_position(p, tdf)
+            raised = next((r for r in (row.get("reasons") or []) if r.get("code") == "stop_raised"), None)
+            if raised:
+                # The ladder moved the stop - keep it in positions.json so the
+                # next check tests the new level (and the mail says it once).
+                try:
+                    positions_store.update_stop(
+                        p["id"], raised["to"],
+                        f"ladder: touched +{raised.get('trigger', '?')}% -> stop at +{raised.get('lock', '?')}%")
+                except Exception as e:
+                    print(f"  could not save the raised stop for {p['ticker']}: {e}")
+            rows.append(row)
+        except (KeyError, TypeError) as e:
+            rows.append({**p, "action": "NO DATA",
+                         "reasons": [{"code": "error", "text": str(e)}]})
+
+    rows.sort(key=lambda r: (POSITION_ACTION_ORDER.get(r.get("action"), 9),
+                             r.get("ticker", "")))
+    return rows
+
+
+# ============================================================
 # EARNINGS CHECK (only for ENTER/ALMOST stocks)
 # ============================================================
 
@@ -783,7 +1052,7 @@ def run_scan():
     print("=" * 60)
 
     # 1. Get tickers
-    print("\n[1/5] Fetching stock universe...")
+    print("\n[1/6] Fetching stock universe...")
     tickers = get_tickers()
     print(f"  Total: {len(tickers)} tickers")
 
@@ -792,7 +1061,7 @@ def run_scan():
         return None
 
     # 2. Download data
-    print(f"\n[2/5] Downloading market data...")
+    print(f"\n[2/6] Downloading market data...")
     data = download_data(tickers)
 
     # Drop today's still-forming daily bar if the US session is open, so signals
@@ -805,7 +1074,7 @@ def run_scan():
             print("  Dropped today's still-forming daily bar (using confirmed bars only).")
 
     # 3. Analyze each stock
-    print(f"\n[3/5] Analyzing stocks...")
+    print(f"\n[3/6] Analyzing stocks...")
     results = []
     errors = 0
     single = len(tickers) == 1
@@ -837,7 +1106,7 @@ def run_scan():
             continue
 
     # 4. Earnings check for top candidates
-    print(f"\n[4/5] Checking earnings for top candidates...")
+    print(f"\n[4/6] Checking earnings for top candidates...")
     candidates = [r["ticker"] for r in results if r["status"] in ("ENTER", "ALMOST")]
     if candidates and BLOCK_EARNINGS:
         print(f"  Checking {len(candidates)} stocks...")
@@ -881,7 +1150,7 @@ def run_scan():
     # Downloads EXTENDED history (10y) for just the candidates - TradingView's
     # chart loads ~10y of bars, so this matches its trade counts/verdicts.
     # The strategy's rare entries need many years to form a meaningful sample.
-    print(f"\n[5/5] Backtesting actionable setups for scoring...")
+    print(f"\n[5/6] Backtesting actionable setups for scoring...")
     bt_candidates = [r for r in results if r["status"] in BACKTEST_STATUSES] if RUN_BACKTEST else []
     print(f"  Backtesting {len(bt_candidates)} stocks ({BACKTEST_HISTORY_PERIOD} history)...")
 
@@ -928,6 +1197,10 @@ def run_scan():
             and r.get("earnings_known")          # fail-safe: never prime on unknown earnings
         )
 
+    # 6. Open positions - does the strategy say to get OUT of anything held?
+    print(f"\n[6/6] Checking open positions for exit signals...")
+    position_rows = check_open_positions()
+
     # Sort: prime first, then status priority, then backtest score, then daily BX
     results.sort(key=lambda x: (
         0 if x.get("prime") else 1,
@@ -957,6 +1230,19 @@ def run_scan():
     print(f"  Total analyzed:  {len(results)} | Errors: {errors}")
     print(f"{'=' * 60}")
 
+    if position_rows:
+        exits = [p for p in position_rows if p.get("action") == "EXIT"]
+        print(f"\n  OPEN POSITIONS ({len(position_rows)}):")
+        for p in position_rows:
+            pnl = p.get("pnl")
+            pnl_txt = f"{pnl:+8.0f}$" if pnl is not None else "       —"
+            print(f"    {p.get('action', '?'):8s} {p.get('ticker', '?'):6s} "
+                  f"entry ${p.get('entry_price', 0):>8.2f} -> ${p.get('price') or 0:>8.2f}  "
+                  f"P&L {pnl_txt}")
+        if exits:
+            print(f"\n  >>> EXIT SIGNAL on: {', '.join(p['ticker'] for p in exits)}")
+        print(f"{'=' * 60}")
+
     if enter > 0:
         print(f"\n  SETUPS FOUND (* = STRONG BUY, ranked prime-first by score):")
         for r in results:
@@ -983,6 +1269,9 @@ def run_scan():
         "watch_count": watch,
         "earnings_blocked": earnings_blocked,
         "errors": errors,
+        "positions": position_rows,
+        "positions_open": len(position_rows),
+        "positions_exit": sum(1 for p in position_rows if p.get("action") == "EXIT"),
         "config": {
             "account_size": ACCOUNT_SIZE,
             "stop_method": STOP_METHOD,

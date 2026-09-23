@@ -221,6 +221,55 @@
             border-radius: 6px;
             letter-spacing: 0.5px;
         }
+
+        .pos-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 16px;
+        }
+        .pos-panel.has-exit {
+            border-color: var(--red);
+            box-shadow: 0 0 18px rgba(248, 81, 73, 0.22);
+        }
+        .pos-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .pos-card {
+            background: var(--bg-main);
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+        }
+        .pos-card.act-exit { border-left-color: var(--red); box-shadow: 0 0 0 1px rgba(248,81,73,0.35); }
+        .pos-card.act-watch { border-left-color: var(--orange); }
+        .pos-card.act-hold { border-left-color: var(--green); }
+        .pos-card.act-none { border-left-color: #57606a; }
+        .pos-card-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .pos-badge {
+            color: #fff;
+            font-weight: 700;
+            font-size: 0.72rem;
+            letter-spacing: 0.5px;
+            padding: 3px 9px;
+            border-radius: 5px;
+        }
+        .pos-facts { color: var(--text-dim); font-size: 0.8rem; margin-top: 4px; }
+        .pos-reasons { margin: 6px 0 0 0; padding-left: 18px; font-size: 0.82rem; }
+        .pos-reasons li { margin: 2px 0; }
+        .pos-empty { color: var(--text-dim); font-size: 0.85rem; }
+        .pos-err { color: var(--red); font-size: 0.82rem; }
         .bt-stats {
             display: flex;
             flex-wrap: wrap;
@@ -290,6 +339,51 @@
             </div>
         </div>
 
+        <!-- Open Positions (exit monitor) -->
+        <div class="pos-panel mb-4" id="posPanel">
+            <div class="pos-head">
+                <h6 class="mb-0">
+                    <i class="bi bi-briefcase-fill"></i> Open Positions
+                    <span class="text-secondary fw-normal" id="posCount"></span>
+                </h6>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-info" id="btnPosCheck">
+                        <i class="bi bi-arrow-repeat" id="posCheckIcon"></i> Check now
+                    </button>
+                    <button class="btn btn-sm btn-outline-secondary" id="btnPosAdd">
+                        <i class="bi bi-plus-lg"></i> Add position
+                    </button>
+                </div>
+            </div>
+            <form class="row g-2 align-items-end mb-3 d-none" id="posForm">
+                <div class="col-6 col-md-2">
+                    <label class="form-label small text-secondary mb-1">Ticker</label>
+                    <input class="form-control form-control-sm" id="posTicker" autocomplete="off">
+                </div>
+                <div class="col-6 col-md-2">
+                    <label class="form-label small text-secondary mb-1">Entry price</label>
+                    <input class="form-control form-control-sm" id="posEntry" type="number" step="0.01">
+                </div>
+                <div class="col-6 col-md-2">
+                    <label class="form-label small text-secondary mb-1">Shares</label>
+                    <input class="form-control form-control-sm" id="posShares" type="number" step="1">
+                </div>
+                <div class="col-6 col-md-2">
+                    <label class="form-label small text-secondary mb-1">Stop</label>
+                    <input class="form-control form-control-sm" id="posStop" type="number" step="0.01">
+                </div>
+                <div class="col-6 col-md-2">
+                    <label class="form-label small text-secondary mb-1">Entry date</label>
+                    <input class="form-control form-control-sm" id="posDate" type="date">
+                </div>
+                <div class="col-6 col-md-2 d-flex gap-2">
+                    <button class="btn btn-sm btn-success flex-grow-1" type="submit">Save</button>
+                </div>
+                <div class="col-12"><div class="pos-err d-none" id="posError"></div></div>
+            </form>
+            <div id="posList"></div>
+        </div>
+
         <!-- Trade Plans (for ENTER stocks) -->
         <div id="tradePlans"></div>
 
@@ -350,6 +444,15 @@
             if (val > 0) return `<span class="delta-pos">+${val.toFixed(2)}</span>`;
             if (val < 0) return `<span class="delta-neg">${val.toFixed(2)}</span>`;
             return `<span style="color:#484f58">0.00</span>`;
+        }
+
+        // Display-only profit target. target_50/profit_50 are the pre-25% key
+        // names, still read so an older latest.json renders instead of throwing.
+        function targetHtml(r) {
+            const price = r.target_price ?? r.target_50;
+            const profit = r.target_profit ?? r.profit_50;
+            if (price === null || price === undefined) return '—';
+            return `$${price.toFixed(2)} (+$${(profit ?? 0).toFixed(0)})`;
         }
 
         function tvLink(ticker) {
@@ -469,8 +572,8 @@
                             </strong>
                         </div>
                         <div class="col-auto">
-                            <span class="label-col">Target +50%:</span>
-                            <strong style="color:var(--green)">$${r.target_50.toFixed(2)} (+$${r.profit_50.toFixed(0)})</strong>
+                            <span class="label-col">Target +${r.target_pct ?? 50}%:</span>
+                            <strong style="color:var(--green)">${targetHtml(r)}</strong>
                         </div>
                         <div class="col-auto">
                             <span class="label-col">R:R:</span>
@@ -484,6 +587,13 @@
                             <a href="${tvLink(r.ticker)}" target="_blank" class="btn btn-sm btn-outline-primary">
                                 <i class="bi bi-graph-up"></i> Open in TradingView
                             </a>
+                        </div>
+                        <div class="col-auto">
+                            <button class="btn btn-sm btn-outline-warning" data-took-trade
+                                    data-ticker="${r.ticker}" data-entry="${r.price}"
+                                    data-shares="${r.shares}" data-stop="${r.stop}">
+                                <i class="bi bi-bookmark-plus"></i> I'm in this trade
+                            </button>
                         </div>
                     </div>
                 </div>`;
@@ -543,6 +653,176 @@
             });
         }
 
+
+        // ============================================================
+        // OPEN POSITIONS - the exit half. The scan finds entries; this
+        // tells you when the strategy says to get out of what you hold.
+        // ============================================================
+        let allPositions = {{ positions | tojson }};
+
+        const POS_STYLE = {
+            'EXIT':        { label: 'EXIT',        cls: 'act-exit',  colour: '#da3633' },
+            'WATCH':       { label: 'WATCH',       cls: 'act-watch', colour: '#9e6a03' },
+            'HOLD':        { label: 'HOLD',        cls: 'act-hold',  colour: '#238636' },
+            'NO DATA':     { label: 'NO DATA',     cls: 'act-none',  colour: '#57606a' },
+            'NOT CHECKED': { label: 'NOT CHECKED', cls: 'act-none',  colour: '#57606a' },
+        };
+
+        function reasonText(r) {
+            const v = r.value;
+            switch (r.code) {
+                case 'stop_hit': return `Stop hit on ${r.date} - low $${r.low} vs stop $${r.stop}`;
+                case 'weekly_red': return `Weekly BX closed red (${v}) - this is the exit signal`;
+                case 'monthly_red': return `Monthly BX closed red (${v}) - this is the exit signal`;
+                case 'weekly_red_forming': return `Weekly BX already red (${v}) but the week hasn't closed yet`;
+                case 'monthly_red_forming': return `Monthly BX already red (${v}) but the month hasn't closed yet`;
+                case 'daily_red': return `Daily red (${v}) but weekly + monthly still green - keep holding`;
+                case 'stop_raised': return `Stop raised from $${r.from} to $${r.to} - the high reached +${r.trigger}% from entry, rule: stop at +${r.lock}%. Move your broker stop.`;
+                case 'all_green': return 'All three timeframes green';
+                case 'no_data': return 'Not enough history to evaluate';
+                case 'error': return r.text || 'Check failed';
+                default: return r.code || '';
+            }
+        }
+
+        function money(v, digits) {
+            return (v === null || v === undefined) ? '—' : '$' + Number(v).toFixed(digits ?? 2);
+        }
+
+        function renderPositions() {
+            const list = document.getElementById('posList');
+            const panel = document.getElementById('posPanel');
+            const count = document.getElementById('posCount');
+            const exits = allPositions.filter(p => p.action === 'EXIT');
+
+            count.textContent = allPositions.length
+                ? `(${allPositions.length}${exits.length ? ` · ${exits.length} to exit` : ''})` : '';
+            panel.classList.toggle('has-exit', exits.length > 0);
+
+            if (!allPositions.length) {
+                list.innerHTML = `<div class="pos-empty">No open trades recorded.
+                    Hit "I'm in this trade" on a setup below, or add one manually -
+                    the daily mail will then tell you when to get out.</div>`;
+                return;
+            }
+
+            list.innerHTML = allPositions.map(p => {
+                const st = POS_STYLE[p.action] || POS_STYLE['NOT CHECKED'];
+                const pnl = p.pnl;
+                const pnlHtml = (pnl === null || pnl === undefined) ? ''
+                    : `<span style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:700">
+                        ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(0)}
+                        (${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}%)</span>`;
+                const reasons = (p.reasons || []).map(r =>
+                    `<li>${reasonText(r)}</li>`).join('');
+                return `
+                <div class="pos-card ${st.cls}">
+                    <div class="pos-card-head">
+                        <span class="pos-badge" style="background:${st.colour}">${st.label}</span>
+                        <a href="${tvLink(p.ticker)}" target="_blank" class="ticker-link">${p.ticker}</a>
+                        ${pnlHtml}
+                        <button class="btn btn-sm btn-outline-secondary ms-auto"
+                                data-close-position data-id="${p.id}" data-ticker="${p.ticker}">
+                            <i class="bi bi-x-lg"></i> Closed it
+                        </button>
+                    </div>
+                    <div class="pos-facts">
+                        entry ${money(p.entry_price)} (${p.entry_date}) ·
+                        now ${money(p.price)} ·
+                        ${p.shares} sh ·
+                        stop ${money(p.stop)} ·
+                        ${p.days_held ?? '—'}d ·
+                        BX m ${p.bx_m ?? '—'} / w ${p.bx_w ?? '—'} / d ${p.bx_d ?? '—'}
+                    </div>
+                    ${p.note ? `<div class="pos-facts">&#128204; ${p.note}</div>` : ''}
+                    <ul class="pos-reasons">${reasons}</ul>
+                </div>`;
+            }).join('');
+        }
+
+        function postPositions(url, body, done) {
+            fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}),
+            })
+                .then(r => r.json().then(j => ({ ok: r.ok, j })))
+                .then(({ ok, j }) => {
+                    if (!ok || j.status === 'error') { done(j.message || 'Request failed'); return; }
+                    allPositions = j.positions || [];
+                    renderPositions();
+                    done(null);
+                })
+                .catch(e => done(String(e)));
+        }
+
+        function showPosError(msg) {
+            const box = document.getElementById('posError');
+            box.textContent = msg || '';
+            box.classList.toggle('d-none', !msg);
+        }
+
+        document.getElementById('btnPosAdd').addEventListener('click', function () {
+            const form = document.getElementById('posForm');
+            form.classList.toggle('d-none');
+            showPosError(null);
+            if (!form.classList.contains('d-none')) document.getElementById('posTicker').focus();
+        });
+
+        document.getElementById('posForm').addEventListener('submit', function (e) {
+            e.preventDefault();
+            showPosError(null);
+            postPositions('/api/positions', {
+                ticker: document.getElementById('posTicker').value,
+                entry_price: document.getElementById('posEntry').value,
+                shares: document.getElementById('posShares').value,
+                stop: document.getElementById('posStop').value,
+                entry_date: document.getElementById('posDate').value,
+            }, err => {
+                if (err) { showPosError(err); return; }
+                this.reset();
+                this.classList.add('d-none');
+            });
+        });
+
+        document.getElementById('btnPosCheck').addEventListener('click', function () {
+            const icon = document.getElementById('posCheckIcon');
+            this.disabled = true;
+            icon.classList.add('refresh-spin');
+            postPositions('/api/positions/check', {}, err => {
+                this.disabled = false;
+                icon.classList.remove('refresh-spin');
+                if (err) showPosError(err);
+            });
+        });
+
+        document.getElementById('posList').addEventListener('click', function (e) {
+            const btn = e.target.closest('[data-close-position]');
+            if (!btn) return;
+            if (!confirm(`Close ${btn.dataset.ticker}? It will stop showing in the daily mail.`)) return;
+            btn.disabled = true;
+            postPositions(`/api/positions/${btn.dataset.id}/close`, {},
+                err => { if (err) { btn.disabled = false; showPosError(err); } });
+        });
+
+        document.getElementById('tradePlans').addEventListener('click', function (e) {
+            const btn = e.target.closest('[data-took-trade]');
+            if (!btn) return;
+            btn.disabled = true;
+            postPositions('/api/positions', {
+                ticker: btn.dataset.ticker,
+                entry_price: btn.dataset.entry,
+                shares: btn.dataset.shares,
+                stop: btn.dataset.stop,
+            }, err => {
+                btn.disabled = false;
+                if (err) { alert(err); return; }
+                btn.innerHTML = '<i class="bi bi-check-lg"></i> Tracked';
+                btn.classList.remove('btn-outline-warning');
+                btn.classList.add('btn-outline-success');
+            });
+        });
+
         // Trigger scan
         function triggerScan() {
             const btn = document.getElementById('btnScan');
@@ -581,12 +861,18 @@
                     renderTradePlans(allResults);
                     renderTable(currentFilter);
                 });
+            // positions come from the store, not from latest.json - a trade
+            // closed in the UI since the last scan is still listed there
+            fetch('/api/positions')
+                .then(r => r.json())
+                .then(pj => { allPositions = pj.positions || []; renderPositions(); });
         }
 
         // Auto-refresh every 5 minutes
         setInterval(refreshData, 300000);
 
         // Initial render
+        renderPositions();
         renderPills();
         renderTradePlans(allResults);
         renderTable(currentFilter);

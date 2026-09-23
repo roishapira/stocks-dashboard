@@ -15,7 +15,7 @@
 
   "mail_from": "noreply@pgishonim.com",
   "mail_from_name": "DiCarlo BX Scanner",
-  "mail_to": ["pgishonim@gmail.com"],
+  "mail_to": ["you@example.com"],
 
   "_behaviour": "daily_digest sends a summary even on days with zero strong buys, so a quiet inbox proves the scan ran. realert_days stops the same ticker alerting on each of the 2-3 scans it stays prime for.",
   "daily_digest": true,

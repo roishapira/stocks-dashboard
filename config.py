@@ -44,6 +44,11 @@ ACCOUNT_SIZE = 2000.0
 MAX_RISK_PCT_STRICT = 2.0
 MAX_RISK_PCT_OVERRIDE = 5.0
 TARGET_POSITION_PCT = 33.0
+# DISPLAY ONLY. Nothing exits here - the strategy has no profit target, a trade
+# runs until the stop or until the weekly/monthly BX turns red (see
+# evaluate_position). This number exists to give the R:R shown next to it a
+# reference point, so keep it at a move you'd actually expect to capture.
+TARGET_PROFIT_PCT = 25.0
 MIN_POSITION_SIZE = 500.0
 MAX_POSITION_PCT = 50.0
 COMMISSION_PER_TRADE = 2.5
@@ -52,6 +57,20 @@ COMMISSION_PER_TRADE = 2.5
 STOP_METHOD = "ATR"     # "ATR", "Recent Low", "Fixed %"
 ATR_MULT = 2.0
 FIXED_STOP_PCT = 7.0
+
+# === Stop ladder (research of 2026-09-22: 16,357 trades, 1990-2026, all US stocks) ===
+# There is NO take-profit in this strategy - every fixed TP from 3% to 100%
+# lowered the expectancy, because the profit comes from the few trades that
+# run far. The one thing that was free: once a trade has run, raise the stop.
+# Each step is (trigger_pct, lock_pct): when the HIGH since entry has reached
+# entry * (1 + trigger%), the stop becomes at least entry * (1 + lock%).
+# check_open_positions() applies it to positions.json by itself and the mail
+# goes out as [להעלות סטופ] so you move the broker stop. Trailing stops,
+# partial exits and locks above +25% were all tested and are worse.
+STOP_LADDER = [
+    (15.0, 0.0),    # touched +15%  -> stop at the entry price (breakeven)
+    (50.0, 25.0),   # touched +50%  -> stop at entry +25%
+]
 
 # === Stock Universe ===
 # "sp500"           - S&P 500 only (~500 tickers)

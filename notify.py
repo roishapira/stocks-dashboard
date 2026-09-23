@@ -3,6 +3,13 @@ DiCarlo BX Scanner - Email notifier
 ===================================
 Reads results/latest.json (or the dict run_scan() just returned) and sends:
 
+  * EXIT alert       - a trade you hold (positions.json) hit its stop or its
+                       weekly/monthly BX turned red. Outranks everything else:
+                       the strategy has no profit target, so this is the ONLY
+                       thing that ends a trade.
+  * STOP RAISE       - the stop ladder (config.STOP_LADDER) moved a held
+                       trade's stop up; the mail goes out as [להעלות סטופ]
+                       so you move the broker stop to match.
   * STRONG BUY alert - the moment a *new* prime setup shows up
   * Daily digest     - once a day even when there is nothing, so that a quiet
                        inbox proves the scan ran instead of hiding that it broke
@@ -167,6 +174,8 @@ def load_state():
     except Exception:
         state = {}
     state.setdefault("alerted", {})       # ticker -> ISO date of last alert
+    state.setdefault("exit_alerted", {})  # ticker -> ISO date of last exit alert
+    state.setdefault("raise_alerted", {})  # ticker -> ISO date of last stop-raise alert
     state.setdefault("last_digest", "")   # ISO date
     state.setdefault("last_error", "")    # ISO date, throttles crash mails
     return state
@@ -175,6 +184,10 @@ def load_state():
 def save_state(state):
     cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     state["alerted"] = {t: d for t, d in state["alerted"].items() if d >= cutoff}
+    state["exit_alerted"] = {t: d for t, d in state.get("exit_alerted", {}).items()
+                             if d >= cutoff}
+    state["raise_alerted"] = {t: d for t, d in state.get("raise_alerted", {}).items()
+                              if d >= cutoff}
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -217,10 +230,16 @@ CSS_TH = ("padding:6px 10px;border-bottom:2px solid #d1d5db;font-size:12px;"
 
 def _prime_card(r):
     bt = r.get("backtest") or {}
+    # target_50/profit_50 are the pre-25% key names - still read them so a
+    # latest.json written by an older scan renders instead of showing dashes.
+    tgt_pct = r.get("target_pct", 50)
+    tgt_price = r.get("target_price", r.get("target_50"))
+    tgt_profit = r.get("target_profit", r.get("profit_50"))
     rows = [
         ("כניסה", f"${_num(r.get('price'))}"),
         ("סטופ", f"${_num(r.get('stop'))}  ({_num(r.get('stop_pct'), '{:.1f}')}%)  [{r.get('method', '')}]"),
-        ("יעד 50%", f"${_num(r.get('target_50'))}  (רווח ${_num(r.get('profit_50'))})"),
+        (f"יעד {_num(tgt_pct, '{:.0f}')}%",
+         f"${_num(tgt_price)}  (רווח ${_num(tgt_profit)})  —  לתצוגה בלבד"),
         ("כמות", f"{r.get('shares', '—')} מניות  =  ${_num(r.get('cost'), '{:.0f}')}"),
         ("סיכון", f"${_num(r.get('risk'), '{:.0f}')}  ({_num(r.get('risk_pct'), '{:.1f}')}% מהתיק)   R:R {_num(r.get('rr'), '{:.1f}')}"),
         ("בקטסט", f"{bt.get('verdict', '—')} · score {r.get('score', '—')} · "
@@ -282,8 +301,124 @@ def _enter_table(rows):
     )
 
 
-def build_html(data, new_primes, enters, stale_hours=None, cfg=None):
+# --- open positions -------------------------------------------------
+# scanner.evaluate_position() emits structured reason codes, not sentences,
+# so the mail can phrase them in Hebrew while the dashboard uses English.
+
+POS_ACTION = {
+    "EXIT":    ("יציאה", "#dc2626", "#fef2f2"),
+    "WATCH":   ("מעקב", "#d97706", "#fffbeb"),
+    "HOLD":    ("מחזיקים", "#16a34a", "#f0fdf4"),
+    "NO DATA": ("לא נבדק", "#6b7280", "#f9fafb"),
+}
+
+
+def _reason_he(reason):
+    reason = reason or {}
+    code = reason.get("code")
+    v = _num(reason.get("value")) if reason.get("value") is not None else ""
+    if code == "stop_hit":
+        return (f"הסטופ נפגע ב-{reason.get('date')} — הנמוך ירד ל-${_num(reason.get('low'))} "
+                f"מול סטופ ${_num(reason.get('stop'))}")
+    if code == "stop_raised":
+        return (f"הסטופ הועלה מ-${_num(reason.get('from'))} ל-${_num(reason.get('to'))} — "
+                f"המניה נגעה ב-+{_num(reason.get('trigger'), '{:.0f}')}% מהכניסה, "
+                f"והכלל הוא סטופ ב-+{_num(reason.get('lock'), '{:.0f}')}%. לעדכן את הסטופ אצל הברוקר.")
+    if code == "weekly_red":
+        return f"ה-BX השבועי נסגר אדום ({v}) — זה איתות היציאה של האסטרטגיה"
+    if code == "monthly_red":
+        return f"ה-BX החודשי נסגר אדום ({v}) — זה איתות היציאה של האסטרטגיה"
+    if code == "weekly_red_forming":
+        return f"ה-BX השבועי כבר אדום ({v}) אבל השבוע עוד לא נסגר — לעקוב"
+    if code == "monthly_red_forming":
+        return f"ה-BX החודשי כבר אדום ({v}) אבל החודש עוד לא נסגר — לעקוב"
+    if code == "daily_red":
+        return f"היומי אדום ({v}) אבל שבועי וחודשי ירוקים — ממשיכים להחזיק"
+    if code == "all_green":
+        return "שלושת הטיים-פריימים ירוקים"
+    if code == "no_data":
+        return "אין מספיק נתונים לבדיקה"
+    if code == "error":
+        return f"שגיאה בבדיקה: {reason.get('text', '')}"
+    return str(code or "")
+
+
+def _position_box(p):
+    label, colour, bg = POS_ACTION.get(p.get("action"), POS_ACTION["NO DATA"])
+    pnl = p.get("pnl")
+    if pnl is None:
+        pnl_txt = "—"
+    else:
+        pct = p.get("pnl_pct") or 0
+        pnl_txt = (f"{'+' if pnl >= 0 else ''}${_num(pnl, '{:.0f}')} "
+                   f"({'+' if pct >= 0 else ''}{_num(pct, '{:.1f}')}%)")
+
+    facts = (f"כניסה ${_num(p.get('entry_price'))} ({_esc(p.get('entry_date', ''))}) · "
+             f"עכשיו ${_num(p.get('price'))} · "
+             f"{p.get('shares', '—')} מניות · "
+             f"סטופ ${_num(p.get('stop'))} · "
+             f"{p.get('days_held', '—')} ימים")
+    bx = (f"BX monthly {_num(p.get('bx_m'))} · weekly {_num(p.get('bx_w'))} · "
+          f"daily {_num(p.get('bx_d'))}")
+    bullets = "".join(f'<li style="margin:2px 0;">{_esc(_reason_he(r))}</li>'
+                      for r in (p.get("reasons") or []))
+    note_html = (f'<div style="color:#374151;font-size:12px;margin-top:3px;">&#128204; {_esc(p.get("note"))}</div>'
+                 if p.get("note") else "")
+
+    return (
+        f'<div style="border:2px solid {colour};border-radius:8px;margin:0 0 10px 0;'
+        f'overflow:hidden;background:{bg};">'
+        f'<div style="background:{colour};color:#fff;padding:8px 12px;font-size:16px;'
+        f'font-weight:700;">{_esc(label)} &nbsp;<span dir="ltr">{_esc(p.get("ticker"))}</span>'
+        f'<span style="float:left;font-size:14px;" dir="ltr">{_esc(pnl_txt)}</span></div>'
+        f'<div style="padding:8px 12px;font-size:13px;">'
+        f'<div style="color:#4b5563;">{facts}</div>{note_html}'
+        f'<div style="color:#6b7280;font-size:12px;margin-top:2px;" dir="ltr">{_esc(bx)}</div>'
+        f'<ul style="margin:6px 0 0 0;padding-inline-start:18px;color:#111827;">{bullets}</ul>'
+        f'</div></div>'
+    )
+
+
+def _positions_block(positions):
+    if not positions:
+        return ('<div style="color:#9ca3af;font-size:12px;margin:0 0 16px 0;">'
+                'לא רשומות פוזיציות פתוחות — אפשר לרשום כניסה בדשבורד.</div>')
+
+    exits = [p for p in positions if p.get("action") == "EXIT"]
+    raised = [p for p in positions
+              if any((r or {}).get("code") == "stop_raised" for r in (p.get("reasons") or []))]
+    if exits:
+        what = ('מפוזיציה אחת' if len(exits) == 1
+                else f'מ-{len(exits)} פוזיציות')
+        head = ('<h2 style="margin:0 0 8px 0;font-size:22px;color:#dc2626;">'
+                f'יש לצאת {what}</h2>')
+    elif raised:
+        head = ('<h2 style="margin:0 0 8px 0;font-size:22px;color:#d97706;">'
+                f'להעלות סטופ: {_esc(", ".join(p.get("ticker", "") for p in raised))}</h2>')
+    else:
+        head = ('<h3 style="margin:0 0 8px 0;font-size:16px;">'
+                f'פוזיציות פתוחות ({len(positions)}) — אין איתות יציאה</h3>')
+    return head + "".join(_position_box(p) for p in positions) + '<div style="height:10px;"></div>'
+
+
+def _positions_text(positions):
+    if not positions:
+        return []
+    lines = ["=== פוזיציות פתוחות ==="]
+    for p in positions:
+        label = POS_ACTION.get(p.get("action"), POS_ACTION["NO DATA"])[0]
+        lines.append(f"  [{label}] {p.get('ticker')} @ ${_num(p.get('entry_price'))} "
+                     f"-> ${_num(p.get('price'))} | P&L ${_num(p.get('pnl'), '{:.0f}')} "
+                     f"({_num(p.get('pnl_pct'), '{:.1f}')}%)")
+        for r in (p.get("reasons") or []):
+            lines.append(f"      - {_reason_he(r)}")
+    lines.append("")
+    return lines
+
+
+def build_html(data, new_primes, enters, positions=None, stale_hours=None, cfg=None):
     cfg = cfg or DEFAULTS
+    positions = positions or []
     scan_time = data.get("scan_time", "?")
     parts = ['<div style="font-family:Segoe UI,Arial,sans-serif;color:#111827;'
              'max-width:760px;margin:0 auto;" dir="rtl">']
@@ -294,6 +429,8 @@ def build_html(data, new_primes, enters, stale_hours=None, cfg=None):
             'padding:10px 14px;margin-bottom:16px;font-size:14px;">'
             f'<b>שים לב:</b> הנתונים האלה מהסריקה של {_esc(scan_time)} — '
             f'לפני {stale_hours:.0f} שעות. ייתכן שהסריקה של היום לא רצה.</div>')
+
+    parts.append(_positions_block(positions))
 
     if new_primes:
         parts.append(
@@ -342,10 +479,11 @@ def build_html(data, new_primes, enters, stale_hours=None, cfg=None):
     return "".join(parts)
 
 
-def build_text(data, new_primes, enters):
+def build_text(data, new_primes, enters, positions=None):
     lines = [f"סריקה: {data.get('scan_time', '?')}",
              f"נותחו {data.get('total_analyzed', '?')} מניות · "
              f"STRONG BUY {data.get('prime_count', 0)} · ENTER {data.get('enter_count', 0)}", ""]
+    lines.extend(_positions_text(positions or []))
     if new_primes:
         lines.append(f"=== {len(new_primes)} STRONG BUY חדשים ===")
         for r in new_primes:
@@ -422,6 +560,10 @@ def notify(data=None, force=False, dry_run=False):
     results = data.get("results", []) or []
     enters = [r for r in results if r.get("status") == "ENTER"]
     primes = [r for r in results if r.get("prime")]
+    positions = data.get("positions", []) or []
+    exits = [p for p in positions if p.get("action") == "EXIT"]
+    raised = [p for p in positions
+              if any((r or {}).get("code") == "stop_raised" for r in (p.get("reasons") or []))]
 
     # Staleness: a scan that didn't run today must not read as "no opportunities".
     stale_hours = None
@@ -445,10 +587,33 @@ def notify(data=None, force=False, dry_run=False):
 
     digest_due = bool(cfg["daily_digest"]) and (force or state["last_digest"] != today)
 
-    if not new_primes and not digest_due:
-        return "nothing to send (no new strong buy, digest already sent today)"
+    # An exit signal must get out even when the digest already went today -
+    # but only once per ticker per day, so a re-run can't spam.
+    if force:
+        new_exits = exits
+        new_raised = raised
+    else:
+        new_exits = [p for p in exits
+                     if state["exit_alerted"].get(p["ticker"], "") != today]
+        new_raised = [p for p in raised
+                      if state["raise_alerted"].get(p["ticker"], "") != today]
 
-    if new_primes:
+    if not new_primes and not digest_due and not new_exits and not new_raised:
+        return "nothing to send (no new strong buy, no new exit, no raised stop, digest already sent today)"
+
+    if exits:
+        ex = [p["ticker"] for p in exits]
+        ex_head = ", ".join(ex[:3]) + (f" +{len(ex) - 3}" if len(ex) > 3 else "")
+        subject = f"[יציאה] {ex_head}"
+        if new_primes:
+            subject += f" · STRONG BUY {len(new_primes)}"
+    elif raised:
+        names = [p["ticker"] for p in raised]
+        head = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+        subject = f"[להעלות סטופ] {head}"
+        if new_primes:
+            subject += f" · STRONG BUY {len(new_primes)}"
+    elif new_primes:
         names = [r["ticker"] for r in new_primes]
         head = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
         subject = f"[STRONG BUY] {head}"
@@ -457,8 +622,8 @@ def notify(data=None, force=False, dry_run=False):
     if stale_hours is not None:
         subject = "[נתונים ישנים] " + subject
 
-    html = build_html(data, new_primes, enters, stale_hours, cfg)
-    text = build_text(data, new_primes, enters)
+    html = build_html(data, new_primes, enters, positions, stale_hours, cfg)
+    text = build_text(data, new_primes, enters, positions)
 
     if dry_run:
         preview = os.path.join(BASE, "results", "notify_preview.html")
@@ -471,7 +636,11 @@ def notify(data=None, force=False, dry_run=False):
 
     for r in new_primes:
         state["alerted"][r["ticker"]] = today
-    if digest_due or new_primes:
+    for p in exits:
+        state["exit_alerted"][p["ticker"]] = today
+    for p in raised:
+        state["raise_alerted"][p["ticker"]] = today
+    if digest_due or new_primes or new_exits or new_raised:
         state["last_digest"] = today
     save_state(state)
 
