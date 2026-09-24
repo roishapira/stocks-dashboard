@@ -28,16 +28,38 @@ except Exception:
 # TECHNICAL INDICATORS (match TradingView calculations)
 # ============================================================
 
+def _pine_seeded(series, alpha, length):
+    """Recursive average seeded the way Pine's ta.ema / ta.rma are: NaN for
+    the first length-1 values, then the SMA of the first `length` values, then
+    alpha * x + (1 - alpha) * prev. pandas' ewm(adjust=False) alone seeds with
+    the FIRST value - years of daily/weekly bars forget the seed, ~70 monthly
+    bars do not (BFLY's monthly BX came out 34.00 against TradingView's 37.54).
+    Assumes no gaps after the first valid value, which holds for a close
+    series after dropna() and for the EMA/RSI terms built on it."""
+    # copy=True: to_numpy() may hand back the caller's own buffer, and the
+    # NaN-ing below would then blank the start of their Close column.
+    x = series.to_numpy(dtype=float, copy=True)
+    valid = np.flatnonzero(~np.isnan(x))
+    if len(valid) < length:
+        return pd.Series(np.nan, index=series.index)
+    first = valid[0]
+    seed_at = first + length - 1
+    seed = x[first:seed_at + 1].mean()
+    x[:seed_at] = np.nan
+    x[seed_at] = seed
+    return pd.Series(x, index=series.index).ewm(alpha=alpha, adjust=False).mean()
+
+
 def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+    return _pine_seeded(series, 2.0 / (period + 1), period)
 
 
 def rsi(series, period):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_gain = _pine_seeded(gain, 1.0 / period, period)
+    avg_loss = _pine_seeded(loss, 1.0 / period, period)
     rs = avg_gain / avg_loss
     return 100.0 - 100.0 / (1.0 + rs)
 
@@ -243,24 +265,44 @@ def get_tickers():
 # DATA DOWNLOAD (with caching)
 # ============================================================
 
+def _history_cutoff(period):
+    """First date a yfinance period string ('5y', '6mo', 'max') covers."""
+    now = pd.Timestamp.now().normalize()
+    if period.endswith("mo"):
+        return now - pd.DateOffset(months=int(period[:-2]))
+    if period.endswith("y"):
+        return now - pd.DateOffset(years=int(period[:-1]))
+    return None
+
+
 def download_data(tickers):
+    """Returns (daily, monthly_close).
+
+    daily         - MAIN_HISTORY_PERIOD of daily OHLCV, (Price, Ticker) columns
+    monthly_close - month-end closes over MONTHLY_HISTORY_PERIOD, one column per
+                    ticker, for the monthly BX (see config.MONTHLY_HISTORY_PERIOD)
+    """
     base = os.path.dirname(__file__)
     cache_file = os.path.join(base, "cache", "data.pkl")
+    monthly_file = os.path.join(base, "cache", "monthly.pkl")
     cache_meta = os.path.join(base, "cache", "meta.json")
 
-    if os.path.exists(cache_file) and os.path.exists(cache_meta):
+    if all(os.path.exists(p) for p in (cache_file, monthly_file, cache_meta)):
         with open(cache_meta) as f:
             meta = json.load(f)
         age_hours = (time.time() - meta.get("timestamp", 0)) / 3600
         if age_hours < CACHE_HOURS:
             print(f"  Using cached data ({age_hours:.1f}h old)")
-            return pd.read_pickle(cache_file)
+            return pd.read_pickle(cache_file), pd.read_pickle(monthly_file)
 
-    print(f"  Downloading {len(tickers)} tickers ({MAIN_HISTORY_PERIOD} history)...")
+    print(f"  Downloading {len(tickers)} tickers ({MONTHLY_HISTORY_PERIOD} history, "
+          f"daily bars kept for {MAIN_HISTORY_PERIOD})...")
+    cutoff = _history_cutoff(MAIN_HISTORY_PERIOD)
 
     batch_size = DOWNLOAD_BATCH_SIZE if len(tickers) > DOWNLOAD_BATCH_SIZE else len(tickers)
     n_batches = (len(tickers) + batch_size - 1) // batch_size
     frames = []
+    monthly_frames = []
 
     for b in range(n_batches):
         batch = tickers[b * batch_size:(b + 1) * batch_size]
@@ -268,7 +310,7 @@ def download_data(tickers):
         try:
             part = yf.download(
                 batch,
-                period=MAIN_HISTORY_PERIOD,
+                period=MONTHLY_HISTORY_PERIOD,
                 threads=True,
                 progress=False,
             )
@@ -277,6 +319,10 @@ def download_data(tickers):
                 if not isinstance(part.columns, pd.MultiIndex):
                     part.columns = pd.MultiIndex.from_product([part.columns, [batch[0]]],
                                                               names=["Price", "Ticker"])
+                monthly_frames.append(part["Close"].resample("M").last())
+                if cutoff is not None:
+                    idx = part.index.tz_localize(None) if part.index.tz is not None else part.index
+                    part = part.loc[idx >= cutoff]
                 frames.append(part)
         except Exception as e:
             print(f"    Batch {b + 1} error: {e}")
@@ -285,20 +331,32 @@ def download_data(tickers):
         raise RuntimeError("No data downloaded")
 
     data = pd.concat(frames, axis=1)
+    monthly_close = pd.concat(monthly_frames, axis=1)
 
     os.makedirs(os.path.join(base, "cache"), exist_ok=True)
     data.to_pickle(cache_file)
+    monthly_close.to_pickle(monthly_file)
     with open(cache_meta, "w") as f:
         json.dump({"timestamp": time.time(), "tickers": tickers}, f)
 
-    return data
+    return data, monthly_close
 
 
 # ============================================================
 # STOCK ANALYSIS
 # ============================================================
 
-def analyze_stock(ticker, df):
+def _monthly_closes(df, monthly_close):
+    """Month-end closes for the monthly BX: the full-history series when the
+    caller has one (download_data), else whatever the daily frame covers."""
+    if monthly_close is not None:
+        mc = monthly_close.dropna()
+        if not mc.empty:
+            return mc
+    return df["Close"].resample("M").last().dropna()
+
+
+def analyze_stock(ticker, df, monthly_close=None):
     try:
         if df is None or len(df) < 60:
             return None
@@ -324,6 +382,13 @@ def analyze_stock(ticker, df):
         bx_d = float(df["bx"].iloc[-1])
         bx_d_prev = float(df["bx"].iloc[-2]) if len(df) > 1 else 0.0
 
+        # Weekly/monthly BX come from the last CLOSED bar, never the still-
+        # forming one - the same bar run_backtest() trades on (so the backtest
+        # verdict describes this entry) and the one TradingView's table shows
+        # outside market hours. A mid-week read gave BFLY a STRONG BUY on
+        # 2026-09-24 off a +0.22 forming week while the closed week was -4.06.
+        last_date = pd.Timestamp(df.index[-1]).date()
+
         # --- Weekly BX ---
         weekly = (
             df.resample("W-FRI")
@@ -333,20 +398,22 @@ def analyze_stock(ticker, df):
         if len(weekly) < 5:
             return None
         weekly["bx"] = bx_trender(weekly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
-        bx_w = float(weekly["bx"].iloc[-1])
-        bx_w_prev = float(weekly["bx"].iloc[-2]) if len(weekly) > 1 else 0.0
+        wi = _last_closed_idx(weekly.index, last_date)
+        if wi is None or len(weekly) < 1 - wi:
+            return None
+        bx_w = float(weekly["bx"].iloc[wi])
+        bx_w_prev = float(weekly["bx"].iloc[wi - 1])
 
-        # --- Monthly BX (month-end resample; converges with ~5y history) ---
-        monthly = (
-            df.resample("M")
-            .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-            .dropna(subset=["Close"])
-        )
+        # --- Monthly BX (from the stock's full history, like TradingView) ---
+        monthly = _monthly_closes(df, monthly_close).to_frame("Close")
         if len(monthly) < 3:
             return None
         monthly["bx"] = bx_trender(monthly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
-        bx_m = float(monthly["bx"].iloc[-1])
-        bx_m_prev = float(monthly["bx"].iloc[-2]) if len(monthly) > 1 else 0.0
+        mi = _last_closed_idx(monthly.index, last_date)
+        if mi is None or len(monthly) < 1 - mi:
+            return None
+        bx_m = float(monthly["bx"].iloc[mi])
+        bx_m_prev = float(monthly["bx"].iloc[mi - 1])
 
         # Skip degenerate stocks whose BX is NaN (e.g. perfectly flat price over
         # the RSI window). NaN would otherwise break the JSON feed and the JS.
@@ -552,7 +619,7 @@ def calc_position_shares(entry_price, stop_price):
 # Walks full daily history, simulates entries/exits, scores quality.
 # ============================================================
 
-def run_backtest(df):
+def run_backtest(df, monthly_close=None):
     try:
         df = df.dropna(subset=["Close"]).copy()
         if len(df) < 80:
@@ -571,9 +638,7 @@ def run_backtest(df):
         wk_bx = bx_trender(weekly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
         bx_w = wk_bx.reindex(df.index, method="ffill")
 
-        monthly = (df.resample("M")
-                   .agg({"Close": "last"}).dropna(subset=["Close"]))
-        mo_bx = bx_trender(monthly["Close"], SHORT_L1, SHORT_L2, SHORT_L3)
+        mo_bx = bx_trender(_monthly_closes(df, monthly_close), SHORT_L1, SHORT_L2, SHORT_L3)
         bx_m = mo_bx.reindex(df.index, method="ffill")
 
         atr = calc_atr(df["High"], df["Low"], df["Close"])
@@ -733,12 +798,11 @@ def _backtest_stats(pnls, holds, stopped):
 # breaks. This section applies those same two rules to the trades actually
 # held (positions.json) so the daily mail can say GET OUT.
 #
-# One deliberate difference from analyze_stock(): entries read the LIVE,
-# still-forming weekly/monthly bar, but an EXIT is only confirmed on a
-# CLOSED higher-timeframe bar - which is what the backtest uses (it ffills
-# from the period-END label, i.e. the last completed bar). Mid-week dips
-# through zero that recover by Friday would otherwise throw you out of good
-# trades. A still-forming bar that is already red is reported as WATCH.
+# Like analyze_stock()'s entries, an EXIT is only confirmed on a CLOSED
+# higher-timeframe bar - which is what the backtest uses (it ffills from the
+# period-END label, i.e. the last completed bar). Mid-week dips through zero
+# that recover by Friday would otherwise throw you out of good trades. A
+# still-forming bar that is already red is reported as WATCH.
 
 POSITION_ACTION_ORDER = {"EXIT": 0, "WATCH": 1, "NO DATA": 2, "HOLD": 3}
 
@@ -945,7 +1009,9 @@ def check_open_positions():
     print(f"  {len(opens)} open position(s): {', '.join(tickers)}")
 
     try:
-        pdata = yf.download(tickers, period=MAIN_HISTORY_PERIOD,
+        # Full history, so evaluate_position's monthly BX is built the way
+        # TradingView builds it (see config.MONTHLY_HISTORY_PERIOD).
+        pdata = yf.download(tickers, period=MONTHLY_HISTORY_PERIOD,
                             threads=True, progress=False)
     except Exception as e:
         print(f"  Position data download error: {e}")
@@ -1062,7 +1128,7 @@ def run_scan():
 
     # 2. Download data
     print(f"\n[2/6] Downloading market data...")
-    data = download_data(tickers)
+    data, monthly_close = download_data(tickers)
 
     # Drop today's still-forming daily bar if the US session is open, so signals
     # use only confirmed bars (safe to scan any time of day).
@@ -1098,7 +1164,7 @@ def run_scan():
                 errors += 1
                 continue
 
-            result = analyze_stock(ticker, ticker_df)
+            result = analyze_stock(ticker, ticker_df, monthly_close.get(ticker))
             if result:
                 results.append(result)
         except (KeyError, TypeError):
@@ -1171,7 +1237,7 @@ def run_scan():
                     tdf = bt_data.xs(r["ticker"], level="Ticker", axis=1).dropna(how="all")
                 else:
                     tdf = bt_data.dropna(how="all")
-                bt = run_backtest(tdf)
+                bt = run_backtest(tdf, monthly_close.get(r["ticker"]))
         except (KeyError, TypeError):
             bt = None
         r["backtest"] = bt
@@ -1185,8 +1251,9 @@ def run_scan():
             r["bt_verdict"] = None
 
     # PRIME / STRONG BUY = top verdict says ENTER **and** backtest is strongly
-    # green (GOOD or EXCELLENT with a solid score). These are the "both green"
-    # setups worth focusing the limited slots on.
+    # green (GOOD or EXCELLENT with a solid score and a win rate above
+    # PRIME_MIN_WIN_RATE). These are the "both green" setups worth focusing
+    # the limited slots on.
     for r in results:
         bt = r.get("backtest")
         r["prime"] = bool(
@@ -1194,6 +1261,7 @@ def run_scan():
             and bt["verdict"] in ("GOOD", "EXCELLENT")
             and (r["score"] or 0) >= PRIME_MIN_SCORE
             and bt["trades"] >= PRIME_MIN_TRADES
+            and bt["win_rate"] > PRIME_MIN_WIN_RATE
             and r.get("earnings_known")          # fail-safe: never prime on unknown earnings
         )
 
@@ -1220,7 +1288,7 @@ def run_scan():
     print(f"\n{'=' * 60}")
     print(f"  RESULTS")
     print(f"{'=' * 60}")
-    print(f"  STRONG BUY:      {prime}  (ENTER + backtest GOOD/EXCELLENT)")
+    print(f"  STRONG BUY:      {prime}  (ENTER + backtest GOOD/EXCELLENT, win > {PRIME_MIN_WIN_RATE:.0f}%)")
     print(f"  ENTER (total):   {enter}")
     if earnings_blocked:
         print(f"  EARNINGS BLOCK:  {earnings_blocked}")

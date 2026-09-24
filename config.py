@@ -38,6 +38,8 @@ BACKTEST_HISTORY_PERIOD = "10y"  # how far back to backtest. TradingView's chart
 # can't be promoted to a top "strong buy").
 PRIME_MIN_SCORE = 60
 PRIME_MIN_TRADES = 5
+# ...and the backtest win rate must be ABOVE this (50.0 itself does not pass).
+PRIME_MIN_WIN_RATE = 50.0
 
 # === Account & Risk ===
 ACCOUNT_SIZE = 2000.0
@@ -90,10 +92,15 @@ EXCLUDE_ETFS = True                 # Skip ETFs (strategy is for individual stoc
 
 # === Download Performance ===
 DOWNLOAD_BATCH_SIZE = 400           # Download tickers in batches of this size
-# History length for the main scan. MUST be long (~5y) so the WEEKLY and
-# MONTHLY BX (EMA20 + RSI15) actually converge. With <2y the monthly BX is
-# garbage (only ~13 monthly candles) and produces false signals.
+# Daily bars kept for the main scan. ~5y is plenty for the DAILY and WEEKLY
+# BX (EMA20 + RSI15) to converge.
 MAIN_HISTORY_PERIOD = "5y"
+# History the MONTHLY BX is built from. 5y is only ~60 monthly candles, not
+# enough to forget where the EMA/RSI started, so it has to start where
+# TradingView starts it: the stock's first bar. Downloaded once per scan and
+# reduced to monthly closes (keeping every daily bar since 1962 would be GBs).
+# Measured 2026-09-24: 10y still left a 0.03 median / 0.85 p95 gap vs max.
+MONTHLY_HISTORY_PERIOD = "max"
 
 # === Data Cache ===
 CACHE_HOURS = 4     # Re-download data if cache is older than this
